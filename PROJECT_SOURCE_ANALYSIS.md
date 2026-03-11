@@ -505,9 +505,393 @@ CLI / WebChat / App / 消息渠道收到最终结果
 
 ---
 
-## 8. 架构师视角：为什么它要这样分层
+## 8. 多 agent 与通信模型
 
-### 8.1 入口和核心解耦
+这部分回答一个很关键的问题：OpenClaw 到底是不是多 agent 系统，如果是，多 agent 之间怎么协作、怎么通信、怎么回传结果。
+
+### 8.1 是否支持多 agent
+
+支持，而且是明确的一等能力。
+
+从配置和运行时实现来看，OpenClaw 不只是“一个主助手 + 很多工具”，而是支持多个独立 agent 并存的系统。不同 agent 可以有各自的：
+
+- `agentId`
+- workspace
+- agentDir
+- model 配置
+- skills
+- session store
+- routing 绑定
+
+这些 agent 可以被 CLI、Gateway、聊天渠道或内部工具分别调起。
+
+### 8.2 一个 agent 下能否有多个子 agent
+
+可以，但更准确地说，限制单位是“一个 requester session 可以派生多个 subagent session”。
+
+代码里和这件事直接相关的配置有：
+
+- `agents.defaults.subagents.maxConcurrent`
+  - 控制 subagent 全局 lane 的并发上限
+- `agents.defaults.subagents.maxChildrenPerAgent`
+  - 控制单个 requester session 最多能挂多少个活跃子 agent
+- `agents.defaults.subagents.maxSpawnDepth`
+  - 控制子 agent 是否还能继续生成下一级子 agent
+
+从当前实现看：
+
+- 一个主 agent session 可以同时拥有多个子 agent
+- 默认 `maxChildrenPerAgent` 是 **5**
+- 默认 `maxSpawnDepth` 是 **1**
+
+这意味着默认情况下：
+
+- 主 agent 可以生成第一层 subagent
+- 第一层 subagent 默认是叶子节点，不能继续生成下一层
+
+如果把 `maxSpawnDepth` 调大，例如调成 `2` 或 `3`，那么就能形成真正的多层 agent 树。
+
+### 8.3 多 agent 是并行还是串行
+
+不是简单的“全并行”或“全串行”，而是分层并发模型：
+
+- 同一个 session 内部是串行的
+- 不同 session 之间可以并行
+- 普通 agent 和 subagent 还会分别走不同的全局 lane
+
+实现上主要体现在：
+
+- `src/process/command-queue.ts`
+  - 每个 lane 都有自己的队列和 `maxConcurrent`
+- `src/agents/pi-embedded-runner/lanes.ts`
+  - 会把 session 映射成 `session:<key>` 这种 lane
+- `src/gateway/server-lanes.ts`
+  - 启动时给 `main`、`subagent`、`cron` 等 lane 设置并发上限
+
+所以更准确地说：
+
+> OpenClaw 的多 agent 运行模型是“同 session 串行、跨 session 并行、并且受 lane 并发上限控制”。
+
+### 8.4 普通 agent 和普通 agent 之间怎么通信
+
+普通 agent 之间的通信核心不是共享内存，也不是直接函数调用，而是**通过 session 工具向另一个 session 发消息**。
+
+关键工具是：
+
+- `sessions_send`
+- `sessions_list`
+- `sessions_history`
+
+其中最关键的是：
+
+- `src/agents/tools/sessions-send-tool.ts`
+
+这个工具的核心逻辑是：
+
+1. 解析目标 session
+   - 既可以直接传 `sessionKey`
+   - 也可以通过 `label` + 可选 `agentId` 解析目标
+2. 做可见性与权限检查
+   - 同 agent、跨 agent、sandbox 场景都有限制
+   - 跨 agent 通信还要通过 `tools.agentToAgent` 策略
+3. 构造一次内部 agent 请求
+   - 调 Gateway 的 `agent` 方法
+   - `deliver: false`
+   - `channel: INTERNAL_MESSAGE_CHANNEL`
+   - `lane: AGENT_LANE_NESTED`
+4. 给目标 session 发送一条“内部消息”
+   - 这条消息不是外部聊天渠道消息
+   - 而是系统内部 session-to-session 消息
+
+也就是说，OpenClaw 的 agent-to-agent 通信，本质上是：
+
+> 把一个 agent 的请求包装成内部 session 消息，再投递到另一个 agent session 里运行。
+
+这套机制的好处是，agent 间通信仍然沿用统一的 session、transcript、tool、timeout 和 reply 体系，而不是另建一套 IPC 机制。
+
+### 8.5 普通 agent 和子 agent 怎么通信
+
+父 agent 和子 agent 的关系，本质上是“请求者 session”和“派生 session”的关系。
+
+创建子 agent 时，核心路径是：
+
+- `sessions_spawn`
+- `src/agents/subagent-spawn.ts`
+
+spawn 时会记录一组很关键的关系信息：
+
+- `requesterSessionKey`
+- `childSessionKey`
+- `runId`
+- child depth
+- spawn metadata
+
+也就是说，子 agent 不是匿名启动的，它从创建开始就和父 session 建立了明确关联。
+
+### 8.6 子 agent 的结果怎么回给父 agent
+
+这部分是 OpenClaw 很重要的一点：**子 agent 默认不是自己去“主动找父 agent 汇报”，而是走自动 announce 回传链路。**
+
+核心实现是：
+
+- `src/agents/subagent-registry.ts`
+- `src/agents/subagent-announce.ts`
+
+里面的关键机制包括：
+
+- subagent registry 维护 `requesterSessionKey -> childSessionKey -> runId` 的运行关系
+- 子 agent 完成后，会触发 `runSubagentAnnounceFlow()`
+- 完成结果会自动整理成一条内部编排消息回到请求者 session
+
+而且这里还有一个很重要的行为：
+
+- 如果父级本身也是 subagent，那么子 agent 的结果会**先回到直接父级 subagent**
+- 不会越级直接回到最顶层主 agent
+
+也就是说，它是树状回传，不是广播式回传。
+
+这点在 `src/agents/subagent-announce.ts` 的系统提示里写得非常明确：
+
+- 你的 subagents 会自动把结果回传给你
+- 不是回给 main agent
+- 让你先做编排、汇总、再向上报告
+
+所以父子 agent 通信的主通道不是 `sessions_send`，而是：
+
+> `sessions_spawn` 创建子 agent，子 agent 完成后通过 announce 流自动把结果推回父 agent。
+
+### 8.7 子 agent 是否能主动联系父 agent
+
+可以，但默认设计鼓励“自动回传”，不鼓励忙轮询。
+
+从 `subagent` 的 system prompt 和工具策略可以看出，推荐模式是：
+
+- 父 agent 生成子 agent
+- 子 agent 专注完成任务
+- 完成后自动回传
+- 父 agent 负责汇总多个子 agent 的结果
+
+而不是：
+
+- 子 agent 不断用轮询方式问父 agent 要不要继续
+- 父 agent 不断去 `sessions_list` / `sessions_history` 忙查询
+
+这也是它能够支撑多 subagent 并发编排的重要原因。
+
+### 8.8 父 agent 如何管理子 agent
+
+除了自动回传，OpenClaw 还提供了对子 agent 的显式管理工具。
+
+关键文件是：
+
+- `src/agents/tools/subagents-tool.ts`
+
+它支持的能力包括：
+
+- 查看子 agent 状态
+- 对子 agent 做 steer
+- 中断或重启子 agent
+- 等待或读取特定运行状态
+
+例如在 `subagents-tool.ts` 里，steer 会：
+
+- 先中断当前子 agent 运行
+- 清理对应 queue / lane
+- 再向对应 `childSessionKey` 发起新的内部 agent 请求
+
+这说明父 agent 和子 agent 的关系并不是“一次 spawn 之后就再也不能干预”，而是存在一个完整的 orchestration / supervision 模型。
+
+### 8.9 一句话总结多 agent 通信模型
+
+可以把 OpenClaw 的多 agent 通信理解成两类：
+
+- 普通 agent <-> 普通 agent
+  - 主要通过 `sessions_send`
+  - 本质是 session-to-session 的内部消息投递
+
+- 父 agent <-> 子 agent
+  - 主要通过 `sessions_spawn` + subagent announce flow
+  - 本质是父级派发任务，子级完成后自动推送结果回父级
+
+如果再压缩成一句话，就是：
+
+> OpenClaw 的多 agent 协作不是共享上下文直接并发写入，而是通过 session 边界、内部消息投递、subagent 注册表和自动回传机制来完成编排。
+
+### 8.10 `main/default agent` 和其他同级 agent 的区别
+
+很多人会把 `main` 理解成“主控 agent”或者“超级权限 agent”，但从代码看，它更准确的含义是：
+
+- 默认 agent
+- 默认路由兜底目标
+- 默认主会话别名的归属者
+- 一个带保留语义的 agentId
+
+它和其他同级 agent 的差别，主要在下面几点。
+
+#### 默认路由落点
+
+当路由没有命中更具体的 binding 时，系统会回退到默认 agent。
+
+也就是说：
+
+- 其他 agent 更像显式指定或显式绑定的目标
+- `main/default agent` 是系统找不到更具体目标时的兜底对象
+
+#### `main` 主会话别名默认属于它
+
+OpenClaw 里“main session”不是随便哪个 agent 都能平等占有的抽象名词。  
+默认情况下，`main` 这类主会话别名会解析到默认 agent。
+
+这也是为什么很多地方会看到：
+
+- `agent:main:main`
+- 或者配置层的 `default=true`
+
+#### `main` 这个字面 ID 有保留语义
+
+`main` 不是普通字符串，而是保留的默认 agentId。  
+所以系统层面对它有一些特殊处理，例如不能被当成普通 agent 名字随意创建或删除。
+
+#### 它不是天然高权限 agent
+
+这是最容易误解的一点。
+
+从代码看，owner-only 工具权限主要取决于：
+
+- `senderIsOwner`
+- 工具策略
+- sandbox 策略
+- agent-to-agent allowlist
+
+而不是取决于当前 agent 是不是 `main`。
+
+所以更准确地说：
+
+> `main/default agent` 的特殊性主要是“默认性”和“保留语义”，不是“特权性”。
+
+### 8.11 agent 的运行时状态模型
+
+另一个常见误解是：是不是每个 agent 都对应一个独立常驻进程，OpenClaw 启动后所有 agent 都会一起待命。
+
+从实现看，默认不是这样。
+
+#### 不同 agent 默认不是不同常驻进程
+
+在默认 embedded runtime 下，多个 agent 共享同一个 OpenClaw / Gateway 运行时进程。  
+agent 的区别主要体现在：
+
+- `agentId`
+- `sessionKey`
+- workspace
+- agentDir
+- model / skills / routing 配置
+- lane / queue
+
+也就是说，agent 更像“逻辑运行单元”而不是“一个 agent 一个 OS 进程”。
+
+#### 默认是按需激活，不是全量预热
+
+OpenClaw 启动后，通常启动的是这些基础设施：
+
+- CLI 或 Gateway 进程
+- channels / 控制平面
+- queue / lane 调度
+- heartbeat runner
+- cron
+- 插件与运行时基础能力
+
+但不会默认把所有 agent 都先跑起来待命。
+
+更准确地说：
+
+- agent 配置会先被加载
+- 真正的 agent run 会在有请求命中时才被触发
+
+#### 不是“只启动了 main agent”
+
+严格来说，启动后并不是“main agent 已经常驻运行，其他 agent 没启动”。  
+实际情况更像：
+
+- 默认 agent 是默认路由目标
+- 其他 agent 也是已配置可用状态
+- 任何 agent 在被命中时都可以立即被调度运行
+
+所以区别不在“有没有先启动进程”，而在“有没有请求或事件命中它”。
+
+### 8.12 系统怎么匹配、触发和调起相关 agent
+
+从源码看，agent 的激活主要有几种路径。
+
+#### 方式 1：CLI 显式指定
+
+例如：
+
+- `openclaw agent --agent ops --message "..."`
+
+这时系统会直接把请求指向指定 agent。  
+这属于最明确、最直接的触发方式。
+
+#### 方式 2：路由 binding 自动命中
+
+外部消息进入后，`src/routing/resolve-route.ts` 会根据这些维度决定目标 agent：
+
+- `channel`
+- `accountId`
+- `peer`
+- `parentPeer`
+- `guildId`
+- `teamId`
+- `memberRoleIds`
+
+如果命中了 binding，就会路由到对应 agent。  
+如果没有命中更具体规则，就回退到默认 agent。
+
+#### 方式 3：通过会话 key 直接归属
+
+一旦某条消息或某次会话已经落到某个 `sessionKey`，后续运行通常会继续沿着该 session 所属的 agent 走。  
+所以很多时候，agent 的触发不仅由“新路由”决定，也由“已有 session 归属”决定。
+
+#### 方式 4：系统事件、hook、heartbeat、cron
+
+agent 不只是由用户手动消息触发，还可能被这些系统机制调起：
+
+- hook mapping
+- heartbeat
+- cron
+- wake / background event
+
+这里面如果没有指定有效 agent，很多地方也会回退到默认 agent。
+
+#### 方式 5：agent-to-agent 调用
+
+已经在运行的 agent 还可以通过这些方式调起其他 agent 或相关 session：
+
+- `sessions_send`
+- `sessions_spawn`
+
+前者是给另一个 session 发内部消息，后者是显式生成子 agent。
+
+所以一个 agent 既可以被“外部世界”触发，也可以被“另一个 agent”触发。
+
+### 8.13 把三件事放在一起理解
+
+把 `main/default agent`、运行时状态、触发机制放在一起后，可以得到一个更准确的整体认识：
+
+- `main/default agent` 不是超管进程，而是默认入口和默认兜底目标
+- 其他同级 agent 不是“未启动的备用进程”，而是按需激活的并列逻辑单元
+- OpenClaw 启动后不会把所有 agent 全量预热待命
+- 哪个 agent 真正跑起来，取决于：
+  - 显式 CLI 指定
+  - 路由命中
+  - 既有 session 归属
+  - hook / heartbeat / cron / wake 事件
+  - 其他 agent 的内部调度
+
+---
+
+## 9. 架构师视角：为什么它要这样分层
+
+### 9.1 入口和核心解耦
 
 OpenClaw 明显在避免“每个入口都自己接模型”的架构陷阱。
 
@@ -527,7 +911,7 @@ OpenClaw 明显在避免“每个入口都自己接模型”的架构陷阱。
 
 这是一种比较成熟的“多端共享智能内核”设计。
 
-### 8.2 routing 和 session 是第一公民
+### 9.2 routing 和 session 是第一公民
 
 OpenClaw 不是“收到消息就单次问模型”的简单机器人。  
 从源码能看出它非常重视这些长期存在的系统概念：
@@ -542,7 +926,7 @@ OpenClaw 不是“收到消息就单次问模型”的简单机器人。
 
 这说明它的目标不是一次性问答，而是持续运行、跨渠道、一致可追踪的 agent 系统。
 
-### 8.3 auto-reply 是消息域和 agent 域之间的防腐层
+### 9.3 auto-reply 是消息域和 agent 域之间的防腐层
 
 `src/auto-reply` 的存在，本质上是在做一件很重要的事：
 
@@ -556,7 +940,7 @@ OpenClaw 不是“收到消息就单次问模型”的简单机器人。
 - 会话推进
 - fallback 与恢复
 
-### 8.4 provider 抽象让上层业务保持稳定
+### 9.4 provider 抽象让上层业务保持稳定
 
 如果 provider 差异散落在上层业务里，系统会越来越难维护。  
 OpenClaw 通过模型解析与 provider 规范化，把差异尽量压在底层，带来的好处包括：
@@ -566,7 +950,7 @@ OpenClaw 通过模型解析与 provider 规范化，把差异尽量压在底层�
 - fallback 更容易统一实现
 - auth 管理更集中
 
-### 8.5 运行时具备工程化防护
+### 9.5 运行时具备工程化防护
 
 从源码可以看出它不是一个 demo 型 agent：
 
@@ -581,7 +965,7 @@ OpenClaw 通过模型解析与 provider 规范化，把差异尽量压在底层�
 
 ---
 
-## 9. 关键文件阅读价值说明
+## 10. 关键文件阅读价值说明
 
 ### `src/cli/program/register.agent.ts`
 
@@ -623,7 +1007,7 @@ OpenClaw 通过模型解析与 provider 规范化，把差异尽量压在底层�
 适合看“聊天消息在进入 agent 之前被做了哪些准备”。  
 这是连接消息世界与 agent 世界的重要桥梁。
 
-### 9.1 关键函数索引速查
+### 10.1 关键函数索引速查
 
 如果你已经知道要看哪个文件，下面这份索引可以帮助你直接跳到更关键的符号。
 
@@ -688,9 +1072,9 @@ OpenClaw 通过模型解析与 provider 规范化，把差异尽量压在底层�
 
 ---
 
-## 10. 如果你要继续深挖，建议怎么读
+## 11. 如果你要继续深挖，建议怎么读
 
-### 10.1 新手路线
+### 11.1 新手路线
 
 适合想先跑通整体理解的人：
 
@@ -701,7 +1085,7 @@ OpenClaw 通过模型解析与 provider 规范化，把差异尽量压在底层�
 
 目标是先理解“命令怎么变成一次 agent run”。
 
-### 10.2 消息渠道路线
+### 11.2 消息渠道路线
 
 适合想理解自动回复和多渠道接入的人：
 
@@ -712,7 +1096,7 @@ OpenClaw 通过模型解析与 provider 规范化，把差异尽量压在底层�
 
 目标是理解“真实消息如何进入统一内核”。
 
-### 10.3 架构路线
+### 11.3 架构路线
 
 适合想评估设计取舍的人：
 
@@ -726,35 +1110,35 @@ OpenClaw 通过模型解析与 provider 规范化，把差异尽量压在底层�
 
 ---
 
-## 11. 这套架构最有价值的地方
+## 12. 这套架构最有价值的地方
 
 从源码角度看，OpenClaw 最强的地方不只是功能多，而是下面这些设计点比较扎实。
 
-### 11.1 把入口和内核分开
+### 12.1 把入口和内核分开
 
 CLI、App、Web、消息渠道都只是入口；  
 核心智能体能力尽量收敛在共享层，避免多套实现分叉。
 
-### 11.2 把消息系统和 agent 系统解耦
+### 12.2 把消息系统和 agent 系统解耦
 
 渠道层负责接入，routing 负责映射，auto-reply 负责上下文整理，agent runtime 负责推理和工具执行。  
 每层都有比较清晰的职责边界。
 
-### 11.3 把 provider 差异尽量收敛到底层
+### 12.3 把 provider 差异尽量收敛到底层
 
 这样不同模型后端不会撕裂上层业务流程。
 
-### 11.4 重视长期状态，而不只是单轮问答
+### 12.4 重视长期状态，而不只是单轮问答
 
 从 session、history、transcript、delivery 等机制能看出，这个系统是按持续运行的 agent 来设计的。
 
-### 11.5 runtime 有明确的工程化护栏
+### 12.5 runtime 有明确的工程化护栏
 
 context guard、auth profile、retry、failover、lane 控制、usage 统计，这些都说明它是可以承载复杂运行场景的，而不只是演示项目。
 
 ---
 
-## 12. 一句话总结
+## 13. 一句话总结
 
 OpenClaw 的源码核心可以概括为：
 
