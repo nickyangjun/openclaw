@@ -1138,7 +1138,507 @@ context guard、auth profile、retry、failover、lane 控制、usage 统计，�
 
 ---
 
-## 13. 一句话总结
+## 13. 工具与 Skills 的注册和调用机制
+
+这一部分非常关键，因为它决定了 OpenClaw 里的 agent 到底“凭什么能做事”。
+
+很多人第一次看时会把 tools 和 skills 当成一回事，但从源码看，它们是两种完全不同的机制：
+
+- **工具（tools）**：真正注册给模型的可执行能力，模型可以发起 tool call，运行时会执行它
+- **Skills**：注入到 system prompt 里的能力目录和操作说明，告诉模型“有哪些技能可以读、什么时候该读、读哪个 `SKILL.md`”
+
+如果用一句话区分：
+
+> tools 是“可执行接口”，skills 是“可阅读的操作手册与能力说明”。
+
+### 13.1 工具是在哪里注册的
+
+OpenClaw 的工具注册核心入口是：
+
+- `src/agents/pi-tools.ts`
+- `src/agents/openclaw-tools.ts`
+
+其中：
+
+- `createOpenClawTools()`
+  - 负责创建 OpenClaw 自己的一批高层工具
+  - 例如 `browser`、`cron`、`sessions_send`、`sessions_spawn`、`subagents`、`web_search`、`message`、`nodes` 等
+
+- `createOpenClawCodingTools()`
+  - 负责把 OpenClaw 工具、读写工具、exec/process 工具、plugin tools、策略过滤、sandbox 约束、owner-only 限制等全部拼装成“当前这次 agent run 可见的最终工具集”
+
+所以真正的工具注册不是在 CLI 启动时一次性全局静态挂好，而是：
+
+> 在一次具体 agent run 开始时，按当前上下文动态构造出这次运行真正可用的工具集。
+
+### 13.2 工具是什么时候注册进 agent 的
+
+关键时机在 embedded runtime 的一次执行尝试里。
+
+对应路径：
+
+- `src/agents/pi-embedded-runner/run/attempt.ts`
+
+里面的主线大致是：
+
+1. 解析 workspace、sandbox、skills、bootstrap context
+2. 调 `createOpenClawCodingTools(...)` 生成当前 run 的工具集
+3. 调 `splitSdkTools(...)`
+4. 把工具作为 `customTools` 传给 `createAgentSession(...)`
+5. 再把 system prompt、session、订阅事件等都接上
+
+也就是说，**工具是在 session 创建前后、一次 run 初始化阶段注入进去的**，不是系统启动时全局永久注册。
+
+这一点很重要，因为它意味着：
+
+- 不同 agent、不同 session、不同 channel
+- 甚至同一个 agent 的不同一次运行
+
+拿到的工具集合都可能不一样。
+
+### 13.3 OpenClaw 到底给 agent 注册了哪些工具
+
+从 `createOpenClawTools()` 可以看出，OpenClaw 会注册很多高层工具，例如：
+
+- `browser`
+- `canvas`
+- `nodes`
+- `cron`
+- `message`
+- `tts`
+- `gateway`
+- `agents_list`
+- `sessions_list`
+- `sessions_history`
+- `sessions_send`
+- `sessions_spawn`
+- `subagents`
+- `session_status`
+- `web_search`
+- `web_fetch`
+- `image`
+- `pdf`
+
+此外，`createOpenClawCodingTools()` 还会再补上：
+
+- `read`
+- `write/edit`
+- `apply_patch`
+- `exec`
+- `process`
+- channel 级工具
+- plugin tools
+
+所以 agent 最终看到的其实不是单一工具表，而是一套按上下文拼出来的工具组合。
+
+### 13.4 agent 为什么有时能调这个工具，有时又不能
+
+这是 OpenClaw 工具机制里最核心的地方之一：  
+**工具是否可用，不是只看“系统有没有这个工具”，而是要经过一整套策略过滤。**
+
+主要过滤维度包括：
+
+- 全局工具策略
+- agent 级工具策略
+- provider / model 级工具策略
+- group / channel 级工具策略
+- sandbox tool policy
+- subagent tool policy
+- owner-only policy
+- message provider 限制
+
+这些逻辑大部分都在：
+
+- `src/agents/pi-tools.ts`
+- `src/agents/pi-tools.policy.ts`
+- `src/agents/tool-policy.ts`
+- `src/agents/sandbox/tool-policy.ts`
+
+所以从设计上看，OpenClaw 不是“先把工具全塞给模型，再靠提示词约束”，而是：
+
+> 先在运行时把不该给的工具过滤掉，再把剩余工具真正注册给模型。
+
+### 13.5 agent 什么时候才“具有调用工具的能力”
+
+一个 agent 想具备调用某个工具的能力，至少要同时满足几件事：
+
+1. 这个工具被创建出来
+   - 例如 `createOpenClawTools()` 或 plugin tools 返回了它
+
+2. 这个工具没有被策略过滤掉
+   - 没有被 owner-only、sandbox、subagent depth、channel policy、allow/deny list 等规则剔除
+
+3. 当前模型支持 tools
+   - `supportsModelTools(model)` 必须为真
+
+4. 这个工具被真正传进本次 `createAgentSession(...)`
+   - 否则模型根本看不到它
+
+换句话说：
+
+> “系统里存在这个工具” 不等于 “当前 agent 这次运行就能调用这个工具”。
+
+### 13.6 模型是怎么触发工具调用的
+
+OpenClaw 不是手写 `if intent == x then call tool` 这种逻辑，而是采用 LLM tool calling 模式。
+
+流程大致是：
+
+1. system prompt 里会告诉模型有哪些工具、各工具的摘要和使用建议
+2. 工具 schema 会和 session 一起注册到 runtime
+3. 模型在推理过程中决定是否发起 tool call
+4. runtime 收到 tool call 事件后执行对应工具
+5. 工具结果再回流给模型，继续完成后续推理
+
+从 `run/attempt.ts` 可以看到，工具最终以 `customTools` 形式传给 `createAgentSession(...)`。  
+从 `src/agents/pi-embedded-subscribe.handlers.tools.ts` 可以看到，运行时会处理：
+
+- `tool_execution_start`
+- `tool_execution_update`
+- `tool_execution_end`
+
+也就是说，工具调用是标准的“模型发事件 -> 运行时执行 -> 再把结果喂回模型”的闭环。
+
+#### 更准确地说：模型并没有“真的去执行工具”
+
+这里最容易误解的一点是：
+
+- 模型本身并不具备操作系统权限
+- 模型也不会真的去调用 Node.js 函数
+- 模型更不会自己打开浏览器、读文件或执行 shell
+
+模型真正做的事情其实只是：
+
+> 在输出里产生一个“我想调用某个工具，并附上参数”的结构化意图。
+
+也就是说，模型不是“执行者”，而是“决策者 / 提议者”。
+
+#### 可以把它理解成两层
+
+你可以把 tool calling 理解成下面两层：
+
+1. **模型层**
+   - 根据 prompt、上下文、工具 schema，判断现在是否该调用工具
+   - 如果要调用，就输出：
+     - 工具名
+     - 参数
+     - 可选的中间解释
+
+2. **运行时层**
+   - 解析模型输出的 tool call
+   - 校验工具名和参数
+   - 执行真正的代码
+   - 把执行结果再作为上下文返回给模型
+
+所以本质上不是：
+
+- 模型直接调用工具
+
+而是：
+
+- 模型“请求”运行时帮它调用工具
+
+#### 用一个通俗类比
+
+如果把模型比作一个“坐在办公室里的分析员”，那运行时更像一个“外勤执行系统”。
+
+分析员会说：
+
+- “请帮我读这个文件”
+- “请帮我搜索这个网页”
+- “请帮我执行这条命令”
+
+但真正去读文件、发请求、跑命令的人，不是分析员本人，而是执行系统。
+
+在 OpenClaw 里：
+
+- 模型 = 分析员
+- runtime / tool adapter / session = 执行系统
+
+#### 在 OpenClaw 里，这个“请求”是怎么落地的
+
+这里有一条很关键的实现链：
+
+1. `createOpenClawCodingTools()` 先构造当前 run 可用的工具对象
+2. `splitSdkTools()` 把这些工具转换成 runtime 可接受的格式
+3. `toToolDefinitions()` 把 OpenClaw 的 `tool.execute(...)` 包装成底层 `ToolDefinition.execute(...)`
+4. `createAgentSession(...)` 把这些 `customTools` 注册到 agent session
+5. 底层 agent SDK 在模型决定使用工具时，会调用对应的 `ToolDefinition.execute(...)`
+6. OpenClaw 的 adapter 再把这次调用转回真正的 `tool.execute(...)`
+
+#### tools 从“模型意图”到“运行时执行”的 Mermaid 时序图
+
+```mermaid
+sequenceDiagram
+    participant User as User
+    participant Model as LLM Model
+    participant Session as createAgentSession / Agent SDK
+    participant Adapter as toToolDefinitions() adapter
+    participant RuntimeTool as OpenClaw tool.execute(...)
+    participant Handlers as tool event handlers
+
+    Note over Session: run 初始化阶段
+    Session->>Session: createOpenClawCodingTools()
+    Session->>Session: splitSdkTools()
+    Session->>Adapter: toToolDefinitions(tools)
+    Adapter-->>Session: ToolDefinition[]
+    Session->>Session: createAgentSession({ customTools })
+
+    User->>Model: 提出任务 / 问题
+    Model->>Session: 普通推理输出
+    Note over Model,Session: 模型看见可用 tools 的 schema 与描述
+
+    alt 模型判断不需要工具
+        Session-->>User: 直接返回文本结果
+    else 模型判断需要工具
+        Model->>Session: 产出 tool call 意图<br/>toolName + params
+        Session->>Handlers: emit tool_execution_start
+        Session->>Adapter: ToolDefinition.execute(toolCallId, params)
+        Adapter->>Adapter: before_tool_call hook / 参数规范化
+        Adapter->>RuntimeTool: tool.execute(toolCallId, params, signal, onUpdate)
+        RuntimeTool-->>Adapter: AgentToolResult
+        Adapter-->>Session: 标准化后的 tool result
+        Session->>Handlers: emit tool_execution_end
+        Session->>Model: 把工具结果回灌给模型
+        Model->>Session: 基于结果继续推理
+        Session-->>User: 输出最终答案
+    end
+```
+
+这张图里最重要的不是“模型会调工具”，而是：
+
+- 模型只负责产出 `tool call intent`
+- session / SDK 负责识别这是不是工具调用
+- adapter 负责桥接 SDK 与 OpenClaw 自己的工具接口
+- 真正执行的是 OpenClaw 工具实现里的 `tool.execute(...)`
+- 执行结果会回到模型，形成下一轮推理输入
+
+最关键的桥接点在：
+
+- `src/agents/pi-tool-definition-adapter.ts`
+
+这个文件里的 `toToolDefinitions()` 做了很重要的一层适配：
+
+- 接收 OpenClaw 自己定义的工具对象
+- 产出底层 agent SDK 认识的 `ToolDefinition`
+- 在 `execute(...)` 里真正去调用 `tool.execute(...)`
+
+也就是说，**模型并不是直接调用 OpenClaw 的工具对象，而是先命中 SDK 注册的 ToolDefinition，再由 adapter 转调真正工具实现。**
+
+#### 真正执行工具的是哪一层代码
+
+从 `src/agents/pi-tool-definition-adapter.ts` 可以看到，最终的执行动作落在这里：
+
+- `ToolDefinition.execute(...)`
+- 内部再调用 `tool.execute(toolCallId, executeParams, signal, onUpdate)`
+
+这说明真正执行工具的是：
+
+- OpenClaw 运行时里的工具实现代码
+
+而不是模型本身。
+
+例如：
+
+- `sessions_send` 对应自己的 `tool.execute(...)`
+- `browser` 对应自己的 `tool.execute(...)`
+- `cron` 对应自己的 `tool.execute(...)`
+- `exec` 对应自己的 `tool.execute(...)`
+
+模型只负责“提出调用请求”，运行时代码才负责“真的干活”。
+
+#### 工具调用前后为什么还能看到事件
+
+这是因为 tool call 不只是一次函数跳转，OpenClaw 还围绕这次执行建立了事件流。
+
+当底层 agent SDK 判定模型触发了工具时，会发出类似事件：
+
+- `tool_execution_start`
+- `tool_execution_update`
+- `tool_execution_end`
+
+然后：
+
+- `src/agents/pi-embedded-subscribe.handlers.ts`
+  - 负责把这些事件分发给对应 handler
+- `src/agents/pi-embedded-subscribe.handlers.tools.ts`
+  - 负责处理工具开始、更新、结束时的运行时逻辑
+
+所以你看到的整个过程其实是：
+
+1. 模型输出工具调用意图
+2. SDK 识别为 tool call
+3. SDK 调用注册好的 `ToolDefinition.execute(...)`
+4. OpenClaw 的 adapter 执行真正工具
+5. 运行时发出 tool start/end 事件
+6. 结果再回到模型继续推理
+
+#### 为什么这种设计很重要
+
+这种“模型提出请求，运行时决定执行”的模式有几个关键好处：
+
+- 模型不会直接拥有宿主机权限
+- 运行时可以拦截、过滤、拒绝危险工具
+- 可以在执行前做参数规范化和 hook
+- 可以在执行后做日志、事件、审计、摘要和结果清洗
+- 可以把不同 provider 的 tool calling 接口统一成一套内部执行模型
+
+所以从安全和架构角度讲，tool calling 的重点从来不是“让模型自己执行代码”，而是：
+
+> 让模型通过一个受控协议，请求运行时代它执行代码。
+
+#### 为什么 agent 有时“看起来像会自己用工具”
+
+因为当你从对话层面看时，体验会像这样：
+
+1. agent 读到任务
+2. agent 立刻去搜网页 / 读文件 / 发消息
+3. agent 再回来给你结果
+
+这个体验非常像“agent 自己在调用工具”。
+
+但从实现上看，真正发生的是：
+
+1. 模型预测出一个 tool call
+2. runtime 执行这个 tool call
+3. runtime 把结果回灌给模型
+4. 模型基于新结果继续生成回复
+
+所以“agent 会调用工具”在产品语义上是对的，  
+但在实现语义上，更准确的说法应该是：
+
+> agent 所依赖的模型会发起工具调用请求，而 OpenClaw 运行时负责真正执行工具。
+
+#### 把这件事压缩成一句话
+
+你可以用下面这句话记住这个机制：
+
+> 模型不会直接执行工具，它只会输出“该调用哪个工具、参数是什么”；真正执行工具的是 OpenClaw 运行时中注册进去的 `ToolDefinition.execute -> tool.execute` 这条链路。
+
+### 13.7 工具调用后，OpenClaw 还做了什么
+
+OpenClaw 不只是简单执行一下工具，然后返回原始结果。
+
+它还会做很多运行时处理，例如：
+
+- 记录 tool start / end 事件
+- 发 agent event
+- 生成工具摘要
+- 输出可读的 tool result
+- 跟踪消息型工具的发送目标
+- 执行 before_tool_call / after_tool_call hooks
+- 做结果清洗和媒体 URL 提取
+
+所以工具调用在 OpenClaw 里是一个受控、可观测、可拦截的运行时过程，而不是一个黑盒函数调用。
+
+### 13.8 Skills 是在哪里注册的
+
+Skills 的主入口是：
+
+- `src/agents/skills.ts`
+- `src/agents/skills/workspace.ts`
+
+其中关键函数包括：
+
+- `loadWorkspaceSkillEntries()`
+- `buildWorkspaceSkillSnapshot()`
+- `buildWorkspaceSkillsPrompt()`
+- `resolveSkillsPromptForRun()`
+
+skills 的来源不是单一目录，而是会从多个技能目录中加载、合并、过滤、去重，然后生成一份可注入 system prompt 的技能提示。
+
+### 13.9 Skills 是什么时候进入 agent 的
+
+skills 也是在一次 run 初始化时进入系统的，但方式和 tools 完全不同。
+
+在 `src/agents/pi-embedded-runner/run/attempt.ts` 里，运行时会：
+
+1. 根据 workspace 和 config 决定要不要加载 skill entries
+2. 应用 skill 的环境变量覆盖
+3. 调 `resolveSkillsPromptForRun(...)` 生成 skills prompt
+4. 把 `skillsPrompt` 塞进 system prompt 构造函数
+
+所以 skills 不是作为可执行 schema 注册，而是作为 prompt 内容注入进 agent 的系统提示。
+
+### 13.10 Skills 怎么影响模型行为
+
+这一点可以从 `src/agents/system-prompt.ts` 看得很清楚。
+
+OpenClaw 会把 skills prompt 放进一个 `<available_skills>` 区域，并明确告诉模型：
+
+- 先扫描 `<available_skills>` 的描述
+- 如果某个 skill 明显适用
+- 再用 `read` 工具去读对应 skill 的 `SKILL.md`
+- 然后照着这个 skill 的说明执行
+
+这意味着 skill 本身通常不是一个直接可调用的 runtime API，而是：
+
+- 一个能力条目
+- 一个说明文件
+- 一个执行套路
+
+也就是说，skills 更像“为模型提供结构化经验与操作规范”，不是“把代码函数暴露给模型”。
+
+### 13.11 Tools 和 Skills 的本质区别
+
+这两个概念最容易混在一起，我把差异直接列出来：
+
+- tools
+  - 真正可执行
+  - 有 schema
+  - 能被模型直接 tool call
+  - 会触发运行时事件
+  - 受 allow/deny/sandbox/owner 等策略过滤
+
+- skills
+  - 主要是 prompt 中的能力说明
+  - 通过 `SKILL.md` 描述操作方法
+  - 模型通常需要先读 skill 文件，再照说明使用已有 tools
+  - 影响的是模型的决策路径，不是底层 runtime 的函数注册
+
+如果压缩成一句话：
+
+> tool 决定“模型能做什么”，skill 决定“模型更应该怎么做”。
+
+### 13.12 plugin tools 和 plugin skills 也能接入
+
+OpenClaw 不是只支持内建 tools / skills。
+
+从当前实现看：
+
+- tools 可以通过 plugin system 注入
+  - `resolvePluginTools(...)`
+- skills 也可以从 plugin skill dirs 里加载
+  - `resolvePluginSkillDirs(...)`
+
+这意味着如果你要做一个专门的“股市分析助手”，最合理的扩展方式其实是：
+
+- 给 OpenClaw 增加一批金融数据工具
+- 再配套一组金融分析 skills
+
+前者解决“能拿到什么数据”，后者解决“如何解释和使用这些数据”。
+
+### 13.13 一句话总结工具和 Skills 机制
+
+可以把 OpenClaw 的这套设计理解成两层：
+
+- **工具层**
+  - 在每次 run 初始化时动态注册
+  - 经过策略过滤后注入给模型
+  - 由模型发起 tool call，运行时执行
+
+- **skills 层**
+  - 在每次 run 初始化时加载并生成 prompt
+  - 作为 `<available_skills>` 注入 system prompt
+  - 让模型在适当时机用 `read` 去读取 `SKILL.md`，再调用已有工具完成任务
+
+这也是 OpenClaw 很有意思的一点：
+
+> 它不是只靠“工具很多”来增强 agent，也不是只靠“提示词很长”来增强 agent，而是把“可执行工具”和“可复用技能说明”拆成两层协同工作。
+
+---
+
+## 14. 一句话总结
 
 OpenClaw 的源码核心可以概括为：
 
