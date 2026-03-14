@@ -10,6 +10,13 @@
 
 > OpenClaw 的核心不是某个 UI，也不是某个聊天渠道，而是一套被 CLI、Gateway、App、消息渠道共同复用的 agent 执行内核。
 
+### 文档更新说明（与当前源码对齐）
+
+- **仓库结构**：补充 `src/acp`（ACP 运行时与 persistent bindings、control-plane、policy 等）。
+- **执行入口**：明确 embedded 对外统一入口为 `src/agents/pi-embedded.ts`，再导出 `pi-embedded-runner`。
+- **工具**：工具列表增加 `sessions_yield`；注明 `pi-tools.*` 已拆为多文件（policy、schema、read、before-tool-call 等），主入口仍为 `pi-tools.ts` 与 `openclaw-tools.ts`。
+- **Subagent**：注明子 agent 注册/清理/完成回传已拆为多模块（subagent-registry-\*、subagent-announce、subagent-control 等）。
+
 ---
 
 ## 1. 新手先看：三分钟建立整体心智模型
@@ -38,6 +45,193 @@
 换成一句更工程化的话就是：
 
 `入口层 -> Gateway / commands -> agent runtime -> model/tool/session -> 结果投递`
+
+### 1.2.1 “标准 agent 任务”长什么样
+
+中间层产出的**标准 agent 任务**在代码里就是一次 `agentCommandFromIngress(opts, runtime, deps)` 的入参 `opts`，类型是 `AgentCommandIngressOpts`（定义在 `src/commands/agent/types.ts`）。  
+无论请求来自 CLI、WebChat、macOS App 还是某条聊天渠道，最终都会收敛成同一形状，再交给 `src/commands/agent.ts` 和 embedded runner 执行。
+
+**必填与常用字段示例：**
+
+```ts
+// 最简形态：只带消息和会话归属
+{
+  message: "今天有什么待办？",
+  sessionKey: "agent:main:main",   // 或 agent:main:subagent:<uuid> 等
+  senderIsOwner: true,             // ingress 必须显式传
+}
+
+// 从 Gateway/渠道 整理后的典型形态（会话已解析、投递目标已算好）
+{
+  message: "帮我总结一下上周的会议纪要",
+  sessionKey: "agent:main:main",
+  sessionId: "550e8400-e29b-41d4-a716-446655440000",
+  channel: "telegram",
+  accountId: "default",
+  to: "telegram:group:-1001234567890:topic:42",
+  threadId: "42",
+  deliver: true,
+  messageChannel: "telegram",
+  runContext: {
+    messageChannel: "telegram",
+    accountId: "default",
+    currentThreadTs: "42",
+  },
+  senderIsOwner: false,
+}
+```
+
+**字段含义速览：**
+
+| 字段                                     | 含义                                                          |
+| ---------------------------------------- | ------------------------------------------------------------- |
+| `message`                                | 用户输入正文（可能已带时间戳、媒体说明、thread 上下文等前缀） |
+| `sessionKey`                             | 会话唯一键，决定用哪个 agent、进哪个 session                  |
+| `sessionId`                              | 当前会话的 ephemeral id（如 /new、/reset 会变）               |
+| `channel` / `accountId`                  | 投递目标渠道与账号                                            |
+| `to`                                     | 具体投递目标（如 telegram:group:xxx:topic:yy）                |
+| `threadId`                               | 线程/话题 id，回信时贴回同 thread                             |
+| `deliver`                                | 是否把回复发到外部渠道                                        |
+| `messageChannel`                         | 来源渠道（用于工具、权限等上下文）                            |
+| `runContext`                             | 嵌入式运行时的渠道/账号/thread 等上下文                       |
+| `senderIsOwner`                          | 是否视为 owner（影响 owner-only 工具）                        |
+| `thinking` / `verbose` / `timeout`       | 可选行为与限制                                                |
+| `images`                                 | 可选多模态图片                                                |
+| `spawnedBy` / `groupId` / `workspaceDir` | 子任务/群组/工作区继承用                                      |
+
+CLI 调用时由 `agent-via-gateway` 或本地 fallback 拼出类似的 `opts`；聊天渠道则由 `resolve-route` 得到 `agentId`/`sessionKey`，再由 `auto-reply` 的 `getReplyFromConfig` → `runPreparedReply` 拼出 `message`、`sessionKey`、`deliver`、`runContext` 等，最终调用的仍是同一个 `agentCommandFromIngress(opts, ...)`。  
+因此**“标准 agent 任务”就是这份统一的 `AgentCommandIngressOpts` 对象**。
+
+### 1.2.2 最终发给大模型的请求结构（含工具时）
+
+在 embedded runner 里，标准 agent 任务会再被转成**一次发给大模型 API 的“上下文”**。  
+这个上下文的类型在底层由 `@mariozechner/pi-ai` 的 `Context` 约定，`streamFn(model, context, options)` 用的就是它。  
+在 OpenClaw 里，**发给大模型的一轮请求**可以概括成下面三部分。
+
+**1. 系统提示（systemPrompt）**
+
+- 一段长文本，由 `buildEmbeddedSystemPrompt` / `buildAgentSystemPrompt` 拼出来。
+- 里面包含：身份与规则、workspace 说明、当前可用工具名列表 + 简短摘要、skills 说明、渠道/权限/沙箱等运行时信息。
+- 会先通过 `applySystemPromptOverrideToSession` 写入 session，再在每次请求里随 context 一起发给模型。
+
+**2. 消息列表（messages）**
+
+- 即“对话历史 + 本轮的当前用户输入”。
+- 每条消息是**多轮对话里的一个 turn**，用 `role` 区分是谁在说话、以及是否是工具结果。
+
+**典型消息形状（发给模型时）：**
+
+```ts
+// 用户轮
+{ role: "user", content: "帮我查一下北京明天天气" }
+// 或多模态：content 为数组，如 [{ type: "text", text: "..." }, { type: "image", ... }]
+
+// 助手轮（纯文本）
+{
+  role: "assistant",
+  content: [{ type: "text", text: "正在查天气…" }],
+  stopReason: "tool_calls",
+  usage: { ... },
+  timestamp: 1234567890,
+}
+
+// 助手轮（含工具调用）
+{
+  role: "assistant",
+  content: [
+    { type: "text", text: "正在查天气…" },
+    { type: "toolCall", id: "call_abc", name: "web_search", arguments: { query: "北京 明天 天气" } },
+  ],
+  stopReason: "tool_calls",
+  ...
+}
+
+// 工具结果轮（执行完工具后塞回对话，让模型继续）
+{
+  role: "toolResult",
+  toolCallId: "call_abc",
+  toolName: "web_search",
+  content: [{ type: "text", text: "北京明天晴，15-25°C…" }],
+  isError: false,
+  timestamp: 1234567891,
+}
+```
+
+也就是说：**发给大模型的问题结构 = `systemPrompt` + `messages`（含 user / assistant / toolResult）**。  
+带工具时，`messages` 里会交替出现 `assistant`（可能带 `content` 里的 `type: "toolCall"`）和 `toolResult`。
+
+**3. 工具定义（tools）**
+
+- 当次 run 允许调用的工具列表，对应 `createAgentSession` 的 `customTools`（经 `toToolDefinitions` 转成底层 `ToolDefinition`）。
+- 每个工具发给模型的是**声明层**，即 name、description、parameters（JSON Schema），**不包含 execute**。  
+  执行在 OpenClaw 运行时里做：模型产出 `toolCall`，adapter 调 `tool.execute(...)`，再把结果写成一条 `toolResult` 消息塞回 `messages`，继续下一轮。
+
+**带工具时的一次请求可以理解为：**
+
+```ts
+{
+  systemPrompt: "...(身份、workspace、工具摘要、skills 等)...",
+  messages: [
+    { role: "user", content: "北京明天天气怎么样？" },
+    {
+      role: "assistant",
+      content: [
+        { type: "text", text: "正在查。" },
+        { type: "toolCall", id: "call_1", name: "web_search", arguments: { query: "北京 明天 天气" } },
+      ],
+      stopReason: "tool_calls",
+      ...
+    },
+    {
+      role: "toolResult",
+      toolCallId: "call_1",
+      toolName: "web_search",
+      content: [{ type: "text", text: "北京明天晴，15-25°C。" }],
+      isError: false,
+    },
+  ],
+  tools: [
+    { name: "web_search", description: "...", parameters: { type: "object", properties: { query: {} }, ... } },
+    { name: "read", description: "...", parameters: { ... } },
+    // ...
+  ],
+}
+```
+
+**大模型回复的是什么**
+
+- 大模型每次“回复”在类型上对应底层 SDK 的 **`AssistantMessage`**（如 `@mariozechner/pi-ai` 的 `AssistantMessage`）。
+- 流式时，会先收到 `message_start`、中间 content 块、最后 `message_end`；**聚合后的完整回复**就是一条 `AssistantMessage`，例如：
+
+```ts
+{
+  role: "assistant",
+  content: [
+    { type: "text", text: "北京明天晴，15-25°C，适合出门。" },
+    // 若本轮还调了工具，会有：
+    // { type: "toolCall", id: "call_2", name: "message", arguments: { ... } },
+  ],
+  stopReason: "end_turn",   // 或 "tool_calls" | "max_tokens" | "error" 等
+  usage: { input: 1200, output: 50, ... },
+  api: "openai-responses",
+  provider: "openai",
+  model: "gpt-5.2",
+  timestamp: 1234567892,
+}
+```
+
+- **content**：数组，每个元素要么是 `{ type: "text", text: string }`，要么是 `{ type: "toolCall", id, name, arguments }`。  
+  没有工具时通常只有 text；有工具时可能先 text 再 toolCall，或只有 toolCall。
+- **stopReason**：表示本轮为何结束（正常结束、要调工具、超长、错误等）。
+- 运行时根据 `content` 里的 `toolCall` 执行工具，把结果写成 `toolResult` 消息追加到 `messages`，再发起下一轮请求；若 `stopReason === "end_turn"` 且没有待执行的 toolCall，则把 text 作为最终回复交给投递/CLI。
+
+**小结**
+
+| 阶段       | 结构概要                                                                                                                        |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| 发给大模型 | `systemPrompt`（ string ）+ `messages`（ user / assistant / toolResult 数组）+ `tools`（ name / description / parameters 数组） |
+| 带工具时   | `messages` 中交替出现含 `type: "toolCall"` 的 assistant 与 `role: "toolResult"` 的消息；`tools` 非空。                          |
+| 大模型回复 | 一条 `AssistantMessage`：`role: "assistant"`，`content` 为 text 或 toolCall 块数组，`stopReason`，`usage` 等。                  |
 
 ### 1.3 为什么这个视角重要
 
@@ -218,6 +412,18 @@ provider 相关能力所在目录。
 - `src/agents/model-selection.ts`
 - `src/agents/pi-embedded-runner/model.ts`
 
+#### `src/acp`
+
+ACP（Agent Client Protocol）运行时与调度层。  
+用于接入外部 coding harness（如 Codex、Claude Code、Gemini CLI 等），与原生 subagent 并列：
+
+- `src/acp/control-plane/`：ACP session 管理、spawn、runtime 选项
+- `src/acp/runtime/`：session 身份、错误、registry
+- `src/acp/persistent-bindings*.ts`：渠道与 ACP session 的持久绑定与路由
+- `src/acp/policy.ts`、`src/acp/translator.ts`：策略与协议转换
+
+详见 `docs/tools/acp-agents.md`。
+
 ### 3.2 `apps/`：客户端与节点
 
 - `apps/macos`
@@ -328,6 +534,8 @@ Gateway 端处理 agent 请求的关键文件是：
 
 `src/commands/agent.ts` 决定“怎么编排”，  
 `src/agents/pi-embedded-runner/run.ts` 决定“怎么执行”。
+
+对外统一入口是 `src/agents/pi-embedded.ts`：它从 `pi-embedded-runner` 再导出 `runEmbeddedPiAgent`、`compactEmbeddedPiSession`、`abortEmbeddedPiRun` 等，CLI 与 Gateway 侧通过 `pi-embedded.js` 引用，便于单一切口与测试替换。
 
 `runEmbeddedPiAgent()` 里包含很多工程化运行逻辑，主要包括：
 
@@ -617,6 +825,8 @@ CLI / WebChat / App / 消息渠道收到最终结果
 
 - `sessions_spawn`
 - `src/agents/subagent-spawn.ts`
+
+子 agent 的注册、清理、完成回传等已拆成多模块：`subagent-registry.ts`、`subagent-registry-store.ts`、`subagent-registry-queries.ts`、`subagent-registry-cleanup.ts`、`subagent-registry-completion.ts`、`subagent-registry-runtime.ts`、`subagent-registry-state.ts`、`subagent-announce.ts`、`subagent-control.ts` 等，便于扩展与测试。
 
 spawn 时会记录一组很关键的关系信息：
 
@@ -1158,11 +1368,13 @@ OpenClaw 的工具注册核心入口是：
 - `src/agents/pi-tools.ts`
 - `src/agents/openclaw-tools.ts`
 
+工具策略与拼装已拆成多文件：`pi-tools.policy.ts`、`pi-tools.schema.ts`、`pi-tools.read.ts`、`pi-tools.before-tool-call.ts`、`pi-tools.abort.ts`、`pi-tools.params.ts`、`pi-tools.types.ts` 等，主入口仍为 `pi-tools.ts` 与 `openclaw-tools.ts`。
+
 其中：
 
 - `createOpenClawTools()`
   - 负责创建 OpenClaw 自己的一批高层工具
-  - 例如 `browser`、`cron`、`sessions_send`、`sessions_spawn`、`subagents`、`web_search`、`message`、`nodes` 等
+  - 例如 `browser`、`cron`、`sessions_send`、`sessions_spawn`、`sessions_yield`、`subagents`、`web_search`、`message`、`nodes` 等
 
 - `createOpenClawCodingTools()`
   - 负责把 OpenClaw 工具、读写工具、exec/process 工具、plugin tools、策略过滤、sandbox 约束、owner-only 限制等全部拼装成“当前这次 agent run 可见的最终工具集”
@@ -1212,6 +1424,7 @@ OpenClaw 的工具注册核心入口是：
 - `sessions_history`
 - `sessions_send`
 - `sessions_spawn`
+- `sessions_yield`
 - `subagents`
 - `session_status`
 - `web_search`
