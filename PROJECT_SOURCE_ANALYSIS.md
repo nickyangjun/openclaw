@@ -1865,3 +1865,63 @@ OpenClaw 的源码核心可以概括为：
 - `src/auto-reply`
 
 理解这四层之间的协作关系，整个项目的主干基本就通了。
+
+---
+
+## 15. 日志查看方式
+
+排查问题或观察运行时行为时，可以用下面几种方式查看 OpenClaw 日志。详细配置见仓库文档 [Logging](/logging)（`docs/logging.md`）。
+
+### 15.1 CLI 实时 tail（推荐）
+
+通过 CLI 连到当前运行的 Gateway，对日志文件做 RPC tail：
+
+```bash
+openclaw logs --follow
+```
+
+- 在 TTY 下输出带颜色、结构化；非 TTY 为纯文本。
+- Gateway 未启动或不可达时，会提示先执行 `openclaw doctor`。
+
+常用选项：
+
+| 选项              | 说明                                             |
+| ----------------- | ------------------------------------------------ |
+| `--follow`        | 持续跟踪新日志（默认先拉最近约 200 条再 follow） |
+| `--json`          | 每行一个 JSON 事件，便于管道处理                 |
+| `--plain`         | 在 TTY 下也强制纯文本                            |
+| `--no-color`      | 关闭 ANSI 颜色                                   |
+| `--local-time`    | 时间按本地时区显示                               |
+| `--limit <n>`     | 先拉最近 n 条再 follow（默认 200）               |
+| `--max-bytes <n>` | 单次读取的最大字节数                             |
+
+### 15.2 日志文件路径
+
+Gateway 默认按天写入（按主机本地时区）：
+
+- **默认路径**：`/tmp/openclaw/openclaw-YYYY-MM-DD.log`
+- **自定义路径**：在 `~/.openclaw/openclaw.json` 的 `logging.file` 中配置固定路径。
+
+直接查看文件示例：
+
+```bash
+tail -f /tmp/openclaw/openclaw-$(date +%Y-%m-%d).log
+```
+
+若配置了固定的 `logging.file`，则 tail 该路径即可。
+
+### 15.3 按渠道过滤
+
+只看某个渠道（如 WhatsApp、Telegram）的日志：
+
+```bash
+openclaw channels logs --channel whatsapp
+```
+
+将 `whatsapp` 换成目标 channel id 即可。
+
+### 15.4 日志级别与诊断
+
+- **级别**：`~/.openclaw/openclaw.json` 中 `logging.level` 控制文件日志级别；`logging.consoleLevel` 控制控制台。也可用环境变量 `OPENCLAW_LOG_LEVEL=debug` 或 CLI 全局选项 `--log-level debug`（如 `openclaw --log-level debug gateway run`）临时提高详细程度。
+- **Web 控制台**：Control UI 的 Logs 页同样 tail 上述日志文件（通过 `logs.tail` RPC）。
+- **macOS**：Gateway 跑在 menubar 应用里时，日志仍写入上述文件；用 `openclaw logs --follow` 即可查看。若需查系统级 unified logging，可使用项目内的 `scripts/clawlog.sh`（与 OpenClaw 应用日志是两套）。
